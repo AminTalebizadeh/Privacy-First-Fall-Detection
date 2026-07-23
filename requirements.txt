@@ -1,0 +1,9 @@
+# Core (pinned majors for reproducibility; tested ranges)
+numpy>=1.26,<3
+torch>=2.2            # CUDA build for the RTX 3050: install per pytorch.org
+ultralytics>=8.2      # YOLOv8n-pose, inference only
+opencv-python>=4.9
+PyYAML>=6.0
+
+# Dev
+pytest>=8.0

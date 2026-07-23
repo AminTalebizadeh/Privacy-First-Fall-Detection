@@ -1,0 +1,66 @@
+# =====================================================================
+# Fall-detection pipeline — single source of truth for all tunables.
+# =====================================================================
+
+seed: 42
+
+pose:
+  model: yolov8n-pose.pt        # ultralytics weight name (auto-downloaded)
+  imgsz: 640                    # inference resolution (acceptance: >=15 FPS @ 640)
+  conf: 0.25                    # detector confidence threshold
+  device: cuda:0                # falls back to cpu automatically
+  half: true                    # FP16 inference on RTX 3050
+
+tracker:
+  iou_gate: 0.25                # min IoU to accept an association
+  centroid_gate_px: 120         # fallback centroid distance gate (pixels)
+  max_age: 15                   # frames a track survives without a match
+  min_hits: 3                   # frames before a track is "confirmed"
+
+features:
+  min_kpt_conf: 0.30            # keypoints below this are masked out
+  velocity_fps: 30.0            # nominal fps used to convert /frame -> /s
+  smooth_alpha: 0.5             # EMA smoothing for hip-center trajectory
+
+window:
+  size: 30                      # frames per classification window (~1 s @ 30fps)
+  stride: 5
+  positive_overlap: 0.30        # window is FALL if >=30% frames inside fall span
+
+model:
+  type: gru                     # gru | cnn
+  input_dim: 55
+  hidden: 64
+  layers: 2
+  dropout: 0.3
+  cnn_channels: [64, 128, 128]  # 1D-CNN baseline
+  cnn_kernel: 5
+
+train:
+  batch_size: 128
+  epochs: 60
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  focal_alpha: 0.75             # weight on the positive (FALL) class
+  focal_gamma: 2.0
+  early_stop_patience: 10       # epochs without val-F1 improvement
+  num_workers: 4
+  ckpt_dir: checkpoints/
+
+alerts:
+  threshold: 0.60               # per-window fall probability threshold
+  k_consecutive: 3              # K consecutive positive windows to fire  (debounce)
+  cooldown_s: 10.0              # seconds after an alert during which no re-fire
+  log_path: alerts.jsonl        # JSON-lines event log (NEVER image data)
+
+eval:
+  event_tolerance_s: 2.0        # alert within +-2 s of GT fall counts as detected
+
+data:
+  cache_dir: cache/skeletons    # .npz skeleton cache == the training set
+  labels_csv: data/labels.csv   # clip_id,fall_start_frame,fall_end_frame,group
+  split: {train: 0.7, val: 0.15, test: 0.15}   # applied over GROUPS, not clips
+
+realtime:
+  privacy_mode: true            # draw skeletons on a blank canvas (no raw video shown)
+  sparkline_len: 90             # windows of probability history to plot

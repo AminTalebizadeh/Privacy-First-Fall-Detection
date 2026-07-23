@@ -1,0 +1,5 @@
+clip_id,fall_start_frame,fall_end_frame,group
+fall-01-cam0,74,132,subject01
+fall-02-cam0,60,118,subject02
+adl-01-cam0,-1,-1,subject01
+adl-02-cam0,-1,-1,subject02
