@@ -38,8 +38,9 @@ cache/
 alerts.jsonl
 *.jsonl
 
-# Dataset videos (large; keep labels.example.csv tracked)
+# Dataset videos / downloads (keep labels.example.csv tracked)
 data/videos/
+data/raw/
 data/**/*.mp4
 data/**/*.avi
 data/**/*.mkv

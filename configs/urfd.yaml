@@ -1,0 +1,58 @@
+seed: 42
+pose:
+  model: yolov8n-pose.pt
+  imgsz: 640
+  conf: 0.25
+  device: cuda:0
+  half: true
+tracker:
+  iou_gate: 0.25
+  centroid_gate_px: 120
+  max_age: 15
+  min_hits: 3
+features:
+  min_kpt_conf: 0.3
+  velocity_fps: 30.0
+  smooth_alpha: 0.5
+window:
+  size: 30
+  stride: 5
+  positive_overlap: 0.3
+model:
+  type: gru
+  input_dim: 55
+  hidden: 64
+  layers: 2
+  dropout: 0.3
+  cnn_channels:
+  - 64
+  - 128
+  - 128
+  cnn_kernel: 5
+train:
+  batch_size: 128
+  epochs: 60
+  lr: 0.001
+  weight_decay: 0.0001
+  focal_alpha: 0.75
+  focal_gamma: 2.0
+  early_stop_patience: 10
+  num_workers: 4
+  ckpt_dir: checkpoints/
+alerts:
+  threshold: 0.6
+  k_consecutive: 4
+  cooldown_s: 10.0
+  log_path: alerts.jsonl
+eval:
+  event_tolerance_s: 2.0
+data:
+  cache_dir: cache/skeletons
+  labels_csv: data/labels.csv
+  split:
+    train: 0.7
+    val: 0.15
+    test: 0.15
+realtime:
+  privacy_mode: true
+  sparkline_len: 90
