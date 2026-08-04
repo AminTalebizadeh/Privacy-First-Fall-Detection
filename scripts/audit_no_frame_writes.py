@@ -22,8 +22,6 @@ FORBIDDEN = [
 ROOT = Path(__file__).resolve().parents[1]
 SCAN = [ROOT / "src", ROOT / "scripts"]
 SELF = Path(__file__).resolve()
-# Doc/exporter scripts may mention forbidden APIs in prose — not real write paths.
-SKIP = {SELF.name, "export_project_guide_fa.py"}
 
 
 def main() -> int:
@@ -31,18 +29,14 @@ def main() -> int:
     hits = []
     for base in SCAN:
         for py in base.rglob("*.py"):
-            if py.name in SKIP:
+            if py.resolve() == SELF:
                 continue
             for i, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
                 if pattern.search(line):
                     hits.append(f"{py.relative_to(ROOT)}:{i}: {line.strip()}")
     if hits:
         print("PRIVACY AUDIT FAILED — image-writing code found:")
-        # Windows consoles may not be UTF-8; don't crash while reporting.
-        try:
-            print("\n".join(hits))
-        except UnicodeEncodeError:
-            sys.stdout.buffer.write(("\n".join(hits) + "\n").encode("utf-8", errors="replace"))
+        print("\n".join(hits))
         return 1
     print("privacy audit OK: no image-writing code paths in src/ or scripts/")
     return 0
