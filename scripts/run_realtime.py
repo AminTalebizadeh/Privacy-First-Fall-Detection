@@ -144,12 +144,27 @@ def main() -> None:
         tracks = tracker.update(boxes, kpts)
         frame_count += 1
 
+        # Remove per-track state only after the tracker has expired that ID.
+        # A temporarily missed detection remains in the tracker and contributes
+        # an all-zero pose for this frame, preserving the time axis.
+        live_track_ids = set(tracker.tracks.keys())
+        for stale_id in list(buffers):
+            if stale_id not in live_track_ids:
+                buffers.pop(stale_id, None)
+                probs.pop(stale_id, None)
+        alerts.retain_tracks(live_track_ids)
+
         for trk in tracks:
             buf = buffers.setdefault(trk.track_id, deque(maxlen=W))
-            buf.append(trk.keypoints.copy())
+            frame_keypoints = (trk.keypoints.copy() if trk.updated_this_frame
+                               else np.zeros_like(trk.keypoints))
+            buf.append(frame_keypoints)
             # classify every S frames once the buffer is full
             if len(buf) == W and frame_count % S == 0:
-                feats = sequence_features(np.stack(buf), fps=fps_nom)
+                feats = sequence_features(
+                    np.stack(buf), fps=fps_nom,
+                    min_conf=float(cfg["features"].get("min_kpt_conf", 0.30)),
+                )
                 assert feats.shape == (W, FEATURE_DIM)
                 with torch.no_grad():
                     x = torch.from_numpy(feats[None]).to(dev)
@@ -166,10 +181,12 @@ def main() -> None:
         inst = 1.0 / max(now - t_prev, 1e-6)
         fps_ema = inst if fps_ema == 0 else 0.9 * fps_ema + 0.1 * inst
         t_prev = now
-        draw_scene(canvas, tracks, probs, now < banner_until, fps_ema, cfg, cv2)
-        if tracks:
+        observed_tracks = [track for track in tracks if track.updated_this_frame]
+        draw_scene(canvas, observed_tracks, probs, now < banner_until,
+                   fps_ema, cfg, cv2)
+        if observed_tracks:
             draw_sparkline(canvas,
-                           alerts.history(tracks[0].track_id,
+                           alerts.history(observed_tracks[0].track_id,
                                           cfg["realtime"]["sparkline_len"]),
                            cfg, cv2)
         # Headless smoke: skip GUI when DISPLAY-less or --max-frames set without UI

@@ -1,137 +1,182 @@
 """Lightweight IoU + centroid multi-person tracker.
 
-Deliberately minimal (no Kalman filter, no ReID, no external deps):
-fall-detection needs *stable short-term identity* so that per-track
-temporal windows are built from the same person — it does not need
-long-term re-identification. Greedy IoU matching with a centroid
-fallback is sufficient for the mostly-static single/dual-person scenes
-of URFD / Le2i, and costs microseconds per frame.
-
-Matching strategy per frame:
-  1. Compute IoU between every live track's last bbox and every new
-     detection; greedily match highest IoU first, gated by `iou_gate`.
-  2. Unmatched pairs get a second chance via centroid distance
-     (handles the "person fell -> bbox shape changed drastically ->
-     IoU collapsed" case, which is exactly the moment we care about).
-  3. Remaining detections spawn new tracks; tracks unseen for
-     `max_age` frames are killed.
+Compatibility note:
+- ``update`` still returns all confirmed live tracks, including tracks that
+  were not detected in the current frame. This preserves the existing API.
+- Consumers must check ``track.updated_this_frame`` before treating its
+  keypoints as a new observation.
+- Track history is bounded to avoid unbounded memory growth.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
 
+TRACK_HISTORY_SIZE = 128
+
+
 def iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
-    """IoU of two [x1,y1,x2,y2] boxes."""
+    """IoU of two [x1, y1, x2, y2] boxes."""
     ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
     ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
     iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
     inter = iw * ih
-    if inter <= 0:
+    if inter <= 0.0:
         return 0.0
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    area_b = (b[2] - b[0]) * (b[3] - b[1])
-    return float(inter / (area_a + area_b - inter + 1e-9))
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return float(inter / (union + 1e-9))
 
 
 def _centroid(box: np.ndarray) -> np.ndarray:
-    return np.array([(box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0])
+    return np.array([(box[0] + box[2]) / 2.0,
+                     (box[1] + box[3]) / 2.0], dtype=np.float32)
 
 
 @dataclass
 class Track:
     track_id: int
-    bbox: np.ndarray                       # last [x1,y1,x2,y2]
-    keypoints: np.ndarray                  # last (17,3) [x,y,conf]
-    hits: int = 1                          # total matched frames
-    age: int = 0                           # frames since last match
+    bbox: np.ndarray
+    keypoints: np.ndarray
+    hits: int = 1
+    age: int = 0
     confirmed: bool = False
-    history: List[np.ndarray] = field(default_factory=list)  # keypoint history
+    # Keep the original public list type for caller compatibility; trim it
+    # explicitly so existing code can continue to use slicing/indexing.
+    history: List[np.ndarray] = field(default_factory=list)
+    # True only when the tracker associated a real detection to this track
+    # during the most recent call to update().
+    updated_this_frame: bool = True
 
 
 class IoUCentroidTracker:
-    def __init__(self, iou_gate: float = 0.25, centroid_gate_px: float = 120.0,
-                 max_age: int = 15, min_hits: int = 3):
-        self.iou_gate = iou_gate
-        self.centroid_gate_px = centroid_gate_px
-        self.max_age = max_age
-        self.min_hits = min_hits
+    def __init__(self, iou_gate: float = 0.25,
+                 centroid_gate_px: float = 120.0,
+                 max_age: int = 15,
+                 min_hits: int = 3):
+        if not 0.0 <= iou_gate <= 1.0:
+            raise ValueError("iou_gate must be in [0, 1]")
+        if centroid_gate_px <= 0:
+            raise ValueError("centroid_gate_px must be positive")
+        if max_age < 0:
+            raise ValueError("max_age must be >= 0")
+        if min_hits < 1:
+            raise ValueError("min_hits must be >= 1")
+
+        self.iou_gate = float(iou_gate)
+        self.centroid_gate_px = float(centroid_gate_px)
+        self.max_age = int(max_age)
+        self.min_hits = int(min_hits)
         self._next_id = 1
         self.tracks: Dict[int, Track] = {}
 
-    # ------------------------------------------------------------------
-    def update(self, boxes: np.ndarray, keypoints: np.ndarray) -> List[Track]:
+    def update(self, boxes: np.ndarray,
+               keypoints: np.ndarray) -> List[Track]:
         """Advance one frame.
 
         Args:
-            boxes: (N,4) xyxy detections (may be empty).
-            keypoints: (N,17,3) matching pose keypoints.
+            boxes: ``(N, 4)`` xyxy detections (may be empty).
+            keypoints: matching ``(N, 17, 3)`` [x, y, confidence] poses.
+
         Returns:
-            list of *confirmed* live tracks after the update.
+            All confirmed live tracks. A returned track is a fresh
+            observation only when ``track.updated_this_frame`` is True.
         """
         boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
         keypoints = np.asarray(keypoints, dtype=np.float32).reshape(-1, 17, 3)
 
-        track_ids = list(self.tracks.keys())
+        if len(boxes) != len(keypoints):
+            raise ValueError(
+                f"boxes/keypoints count mismatch: {len(boxes)} != {len(keypoints)}"
+            )
+        if not np.isfinite(boxes).all() or not np.isfinite(keypoints).all():
+            raise ValueError("boxes and keypoints must contain only finite values")
+
+        # Reset freshness before association. _assign() marks matched tracks.
+        for track in self.tracks.values():
+            track.updated_this_frame = False
+
+        track_ids = sorted(self.tracks)
         unmatched_dets = set(range(len(boxes)))
         unmatched_trks = set(track_ids)
 
-        # ---- pass 1: greedy IoU ---------------------------------------
+        # Pass 1: greedy IoU matching.
         pairs: List[Tuple[float, int, int]] = []
-        for ti in track_ids:
-            for di in range(len(boxes)):
-                v = iou_xyxy(self.tracks[ti].bbox, boxes[di])
-                if v >= self.iou_gate:
-                    pairs.append((v, ti, di))
-        for v, ti, di in sorted(pairs, key=lambda p: -p[0]):
-            if ti in unmatched_trks and di in unmatched_dets:
-                self._assign(ti, boxes[di], keypoints[di])
-                unmatched_trks.discard(ti)
-                unmatched_dets.discard(di)
+        for track_id in track_ids:
+            for det_id in range(len(boxes)):
+                score = iou_xyxy(self.tracks[track_id].bbox, boxes[det_id])
+                if score >= self.iou_gate:
+                    pairs.append((score, track_id, det_id))
 
-        # ---- pass 2: centroid fallback (fall = bbox shape shock) ------
+        for score, track_id, det_id in sorted(
+            pairs, key=lambda item: (-item[0], item[1], item[2])
+        ):
+            if track_id in unmatched_trks and det_id in unmatched_dets:
+                self._assign(track_id, boxes[det_id], keypoints[det_id])
+                unmatched_trks.remove(track_id)
+                unmatched_dets.remove(det_id)
+
+        # Pass 2: centroid fallback for shape changes (e.g. standing -> fallen).
         pairs = []
-        for ti in unmatched_trks:
-            c_t = _centroid(self.tracks[ti].bbox)
-            for di in unmatched_dets:
-                d = float(np.linalg.norm(c_t - _centroid(boxes[di])))
-                if d <= self.centroid_gate_px:
-                    pairs.append((d, ti, di))
-        for d, ti, di in sorted(pairs, key=lambda p: p[0]):
-            if ti in unmatched_trks and di in unmatched_dets:
-                self._assign(ti, boxes[di], keypoints[di])
-                unmatched_trks.discard(ti)
-                unmatched_dets.discard(di)
+        for track_id in sorted(unmatched_trks):
+            previous_center = _centroid(self.tracks[track_id].bbox)
+            for det_id in sorted(unmatched_dets):
+                distance = float(np.linalg.norm(
+                    previous_center - _centroid(boxes[det_id])
+                ))
+                if distance <= self.centroid_gate_px:
+                    pairs.append((distance, track_id, det_id))
 
-        # ---- births -----------------------------------------------------
-        for di in unmatched_dets:
-            t = Track(self._next_id, boxes[di].copy(), keypoints[di].copy())
-            t.history.append(keypoints[di].copy())
-            t.confirmed = t.hits >= self.min_hits   # min_hits<=1: born confirmed
-            self.tracks[self._next_id] = t
+        for distance, track_id, det_id in sorted(
+            pairs, key=lambda item: (item[0], item[1], item[2])
+        ):
+            if track_id in unmatched_trks and det_id in unmatched_dets:
+                self._assign(track_id, boxes[det_id], keypoints[det_id])
+                unmatched_trks.remove(track_id)
+                unmatched_dets.remove(det_id)
+
+        # Births: new detections become new tracks.
+        for det_id in sorted(unmatched_dets):
+            track = Track(
+                track_id=self._next_id,
+                bbox=boxes[det_id].copy(),
+                keypoints=keypoints[det_id].copy(),
+            )
+            self._append_history(track, keypoints[det_id])
+            track.confirmed = track.hits >= self.min_hits
+            self.tracks[self._next_id] = track
             self._next_id += 1
 
-        # ---- ageing / deaths -------------------------------------------
-        for ti in list(self.tracks.keys()):
-            trk = self.tracks[ti]
-            if ti in unmatched_trks:
-                trk.age += 1
-                if trk.age > self.max_age:
-                    del self.tracks[ti]
+        # Age unmatched tracks and remove expired ones.
+        for track_id in list(self.tracks):
+            if track_id in unmatched_trks:
+                track = self.tracks[track_id]
+                track.age += 1
+                if track.age > self.max_age:
+                    del self.tracks[track_id]
 
-        return [t for t in self.tracks.values() if t.confirmed]
+        return [track for track in self.tracks.values() if track.confirmed]
 
-    # ------------------------------------------------------------------
-    def _assign(self, ti: int, box: np.ndarray, kpts: np.ndarray) -> None:
-        trk = self.tracks[ti]
-        trk.bbox = box.copy()
-        trk.keypoints = kpts.copy()
-        trk.hits += 1
-        trk.age = 0
-        trk.history.append(kpts.copy())
-        if trk.hits >= self.min_hits:
-            trk.confirmed = True
+    @staticmethod
+    def _append_history(track: Track, keypoints: np.ndarray) -> None:
+        track.history.append(keypoints.copy())
+        overflow = len(track.history) - TRACK_HISTORY_SIZE
+        if overflow > 0:
+            del track.history[:overflow]
+
+    def _assign(self, track_id: int, box: np.ndarray,
+                keypoints: np.ndarray) -> None:
+        track = self.tracks[track_id]
+        track.bbox = box.copy()
+        track.keypoints = keypoints.copy()
+        track.hits += 1
+        track.age = 0
+        track.updated_this_frame = True
+        self._append_history(track, keypoints)
+        if track.hits >= self.min_hits:
+            track.confirmed = True
