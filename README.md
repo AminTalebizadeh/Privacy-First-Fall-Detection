@@ -384,9 +384,8 @@ This repository is a research and development prototype.
 It is not a certified medical device or a replacement for professional monitoring systems. It must not be relied upon as the sole mechanism for detecting falls or ensuring personal safety.
 
 ---
-
-**Project:** Privacy-Preserving Fall Detection from Skeleton Dynamics  
-**Primary model:** GRU  
-**Dataset:** URFD  
-**Framework:** PyTorch  
+**Project:** Privacy-Preserving Fall Detection from Skeleton Dynamics
+**Primary model:** GRU
+**Dataset:** URFD
+**Framework:** PyTorch
 **Evaluation:** Group-disjoint train/validation/test split

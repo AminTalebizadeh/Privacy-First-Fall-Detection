@@ -22,7 +22,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config",
-        default="configs/urfd_dense_candidate.yaml",
+        default="configs/urfd.yaml",
     )
     args = parser.parse_args()
 
