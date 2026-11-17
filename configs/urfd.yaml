@@ -47,7 +47,7 @@ alerts:
 eval:
   event_tolerance_s: 2.0
 data:
-  cache_dir: cache/skeletons
+  cache_dir: cache/skeletons_dense_candidate
   labels_csv: data/labels.csv
   split:
     train: 0.7

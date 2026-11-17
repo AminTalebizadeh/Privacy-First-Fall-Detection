@@ -27,12 +27,22 @@ class TestFiniteDiff(unittest.TestCase):
         np.testing.assert_allclose(vel[1:-1], 3.0 * t[1:-1] * fps, rtol=1e-6)
         np.testing.assert_allclose(acc[2:-2], 3.0 * fps * fps, rtol=1e-6)
 
-    def test_nan_gap_interpolated_no_spike(self):
+    def test_nan_gap_not_interpolated(self):
         fps = 30.0
         y = np.arange(30, dtype=np.float64)
-        y[10:13] = np.nan                             # 3-frame detection gap
-        vel, _ = finite_diff(y, fps)
-        np.testing.assert_allclose(vel, fps, atol=1e-6)  # still 1 px/frame
+        y[10:13] = np.nan  # 3-frame detection gap
+
+        vel, acc = finite_diff(y, fps)
+
+        # Valid regions retain the original constant velocity.
+        np.testing.assert_allclose(vel[:10], fps, atol=1e-6)
+        np.testing.assert_allclose(vel[13:], fps, atol=1e-6)
+
+        # Long missing-data gap must not be interpolated.
+        np.testing.assert_allclose(vel[10:13], 0.0, atol=1e-6)
+
+        # No artificial acceleration spikes.
+        np.testing.assert_allclose(acc, 0.0, atol=1e-6)
 
     def test_all_nan_safe(self):
         vel, acc = finite_diff(np.full(10, np.nan), 30.0)
@@ -46,6 +56,54 @@ class TestFiniteDiff(unittest.TestCase):
         vel, _ = normalized_hip_dynamics(hip_y, scales, fps)
         # 5 px/frame * 30 fps / 100 px-per-torso = 1.5 torso-lengths/s
         np.testing.assert_allclose(vel, 1.5, atol=1e-6)
+
+    def test_no_valid_torso_scale_returns_zero_dynamics(self):
+        hip_y = np.arange(12, dtype=np.float64) * 5.0
+        scales = np.full(12, np.nan)
+
+        vel, acc = normalized_hip_dynamics(hip_y, scales, fps=30.0)
+
+        np.testing.assert_array_equal(vel, np.zeros(12, dtype=np.float32))
+        np.testing.assert_array_equal(acc, np.zeros(12, dtype=np.float32))
+
+    def test_nonpositive_scales_are_not_valid(self):
+        hip_y = np.arange(8, dtype=np.float64)
+        scales = np.array([0.0, -1.0] * 4)
+
+        vel, acc = normalized_hip_dynamics(hip_y, scales, fps=30.0)
+
+        np.testing.assert_array_equal(vel, np.zeros(8, dtype=np.float32))
+        np.testing.assert_array_equal(acc, np.zeros(8, dtype=np.float32))
+
+    def test_short_internal_gap_is_interpolated(self):
+        y = np.arange(20, dtype=np.float64)
+        y[8:10] = np.nan  # exactly max_gap=2
+
+        vel, acc = finite_diff(y, fps=30.0, max_gap=2)
+
+        np.testing.assert_allclose(vel, 30.0, atol=1e-6)
+        np.testing.assert_allclose(acc, 0.0, atol=1e-6)
+
+    def test_edge_gaps_are_not_interpolated(self):
+        y = np.arange(20, dtype=np.float64)
+        y[:3] = np.nan
+        y[-2:] = np.nan
+
+        vel, acc = finite_diff(y, fps=30.0)
+
+        np.testing.assert_array_equal(vel[:3], np.zeros(3, dtype=np.float32))
+        np.testing.assert_allclose(vel[3:-2], 30.0, atol=1e-6)
+        np.testing.assert_array_equal(vel[-2:], np.zeros(2, dtype=np.float32))
+        np.testing.assert_allclose(acc, 0.0, atol=1e-6)
+
+    def test_mismatched_hip_and_scale_shapes_raise(self):
+        with self.assertRaises(ValueError):
+            normalized_hip_dynamics(
+                np.arange(5, dtype=np.float64),
+                np.ones(4, dtype=np.float64),
+                fps=30.0,
+            )
+
 
 
 class TestSequenceFeatures(unittest.TestCase):

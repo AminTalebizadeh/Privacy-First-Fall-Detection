@@ -23,17 +23,42 @@ from .frame_features import (bbox_aspect_ratio, hip_center_y,
 FEATURE_DIM = 55
 
 
-def _ffill_nan(x: np.ndarray, fill0: float = 0.0) -> np.ndarray:
-    """Forward-fill NaNs (occluded frames inherit the last valid value —
-    temporally consistent, unlike zeroing which fakes a sudden jump)."""
-    out = x.astype(np.float64).copy()
-    last = fill0
-    for i in range(len(out)):
-        if np.isnan(out[i]):
-            out[i] = last
-        else:
-            last = out[i]
+
+def _fill_short_gaps(
+    x: np.ndarray,
+    max_gap: int = 2,
+    default: float = 0.0,
+) -> np.ndarray:
+    """Interpolate only short internal NaN gaps; use default elsewhere."""
+    out = np.asarray(x, dtype=np.float64).copy()
+    valid = np.isfinite(out)
+
+    i = 0
+    while i < len(out):
+        if valid[i]:
+            i += 1
+            continue
+
+        start = i
+        while i < len(out) and not valid[i]:
+            i += 1
+        end = i
+
+        gap_len = end - start
+        bounded = start > 0 and end < len(out)
+
+        if bounded and gap_len <= max_gap:
+            out[start:end] = np.linspace(
+                out[start - 1],
+                out[end],
+                gap_len + 2,
+                dtype=np.float64,
+            )[1:-1]
+            valid[start:end] = True
+
+    out[~valid] = default
     return out
+
 
 
 def sequence_features(kpts_seq: np.ndarray, fps: float = 30.0,
@@ -56,18 +81,94 @@ def sequence_features(kpts_seq: np.ndarray, fps: float = 30.0,
     hips = np.zeros(T, np.float64)
 
     last_scale = None
-    for t in range(T):
-        # per-frame fallback_scale gives temporal stability under occlusion
-        n, m, s = torso_normalize(kpts_seq[t], min_conf, fallback_scale=last_scale)
-        norm[t], masks[t], scales[t] = n, m, s
-        last_scale = s
-        angles[t] = trunk_angle(kpts_seq[t], min_conf)
-        aspects[t] = bbox_aspect_ratio(kpts_seq[t], min_conf)
-        hips[t] = hip_center_y(kpts_seq[t], min_conf)
+    scale_age = 0
+    max_scale_age = 5
 
-    angles = _ffill_nan(angles)
-    aspects = _ffill_nan(aspects, fill0=0.5)
-    vel, acc = normalized_hip_dynamics(hips, scales, fps)
+    for t in range(T):
+        hip_visible = (masks[:, 11] > 0) | (masks[:, 12] > 0)
+        shoulder_visible = (masks[:, 5] > 0) | (masks[:, 6] > 0)
+        torso_valid = hip_visible & shoulder_visible
+
+        dynamics_scales = np.where(torso_valid, scales, np.nan)
+
+        vel, acc = normalized_hip_dynamics(
+            hips,
+            dynamics_scales,
+            fps=fps,
+            max_gap=2,
+        )
+        kpts = kpts_seq[t]
+        conf = kpts[:, 2]
+        xy = kpts[:, :2]
+
+        visible = conf >= min_conf
+        hip_ids = [11, 12]
+        shoulder_ids = [5, 6]
+
+        hips_visible = [i for i in hip_ids if visible[i]]
+        shoulders_visible = [i for i in shoulder_ids if visible[i]]
+
+        # A fresh scale requires at least one visible hip
+        # and one visible shoulder, with non-degenerate geometry.
+        current_torso_valid = bool(hips_visible and shoulders_visible)
+
+        if current_torso_valid:
+            hip_center = xy[hips_visible].mean(axis=0)
+            shoulder_center = xy[shoulders_visible].mean(axis=0)
+            current_scale = float(
+                np.linalg.norm(shoulder_center - hip_center)
+            )
+            current_torso_valid = (
+                np.isfinite(current_scale) and current_scale > 1e-6
+            )
+
+        if current_torso_valid:
+            fallback = None
+        elif last_scale is not None and scale_age < max_scale_age:
+            fallback = last_scale
+        else:
+            fallback = None
+
+        n, m, s = torso_normalize(
+            kpts, min_conf, fallback_scale=fallback
+        )
+
+        norm[t], masks[t], scales[t] = n, m, s
+
+        if current_torso_valid:
+            last_scale = current_scale
+            scale_age = 0
+        else:
+            scale_age += 1
+
+        angles[t] = np.nan_to_num(
+            trunk_angle(kpts, min_conf),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        aspects[t] = np.nan_to_num(
+            bbox_aspect_ratio(kpts, min_conf),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        hips[t] = hip_center_y(kpts, min_conf)
+
+
+        hip_visible = (masks[:, 11] > 0) | (masks[:, 12] > 0)
+    shoulder_visible = (masks[:, 5] > 0) | (masks[:, 6] > 0)
+    torso_valid = hip_visible & shoulder_visible
+
+    dynamics_scales = np.where(torso_valid, scales, np.nan)
+
+    vel, acc = normalized_hip_dynamics(
+        hips,
+        dynamics_scales,
+        fps=fps,
+        max_gap=2,
+    )
 
     feats = np.concatenate(
         [norm.reshape(T, 34), masks,

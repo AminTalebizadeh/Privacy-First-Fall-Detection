@@ -1,168 +1,392 @@
-# Privacy-First Fall Detection
+# Privacy-Preserving Fall Detection from Skeleton Dynamics
 
-Fall detection from 2D pose only. The idea is simple: run YOLOv8n-pose on
-each frame, throw the pixels away, and classify short skeleton windows with
-a tiny temporal model (GRU, plus a 1D-CNN baseline). Alerts go out as JSON.
-Nothing in this repo writes raw video to disk.
+A privacy-oriented fall detection pipeline based on human pose estimation, skeletal motion features, and temporal deep learning.
 
-I built this around the [UR Fall Detection](https://fenix.ur.edu.pl/~mkepski/ds/uf.html)
-dataset (cam0 RGB). Offline, every clip becomes a `.npz` of keypoints — that
-cache is what training actually sees.
+The system analyzes body keypoint dynamics instead of relying on raw RGB appearance for fall classification. It combines pose tracking, temporal feature extraction, a GRU-based classifier, and a debounced alert mechanism.
 
+> **Project status:** Research prototype. The pipeline has been trained and evaluated on the UR Fall Detection (URFD) dataset. The current results are promising, but the small number of fall events in the test split means that further evaluation is required before making real-world safety claims.
+
+## 1. Overview
+
+The project follows this pipeline:
+
+1. Extract human body keypoints from video using YOLOv8 Pose.
+2. Track detected people across frames.
+3. Extract motion and geometric features from skeletal keypoints.
+4. Convert temporal features into fixed-length sliding windows.
+5. Classify each window using a GRU-based neural network.
+6. Convert consecutive positive predictions into fall alerts using thresholding and temporal debouncing.
+
+The main design objective is to reduce dependence on identifiable visual appearance by focusing on skeletal dynamics.
+
+**Privacy note:** Skeleton-based processing is privacy-oriented, but it does not automatically guarantee anonymity or eliminate all privacy risks. The project also includes checks intended to prevent raw video-frame storage in the processing pipeline.
+
+## 2. Main Features
+
+- Human pose estimation using YOLOv8 Pose.
+- Multi-frame person tracking.
+- Skeleton-based temporal feature extraction.
+- GRU-based fall classification.
+- Sliding-window inference.
+- Threshold-based alert generation.
+- Consecutive-positive debouncing and cooldown.
+- Dataset auditing and group-disjoint evaluation.
+- Synthetic data support for development and testing.
+- Tests for feature extraction, tracking, alerts, and dataset handling.
+
+## 3. Project Structure
+
+```text
+Privacy_Preserving_Fall_Detection_from_Skeleton_Dynamics/
+│
+├── configs/
+│   ├── default.yaml
+│   ├── smoke.yaml
+│   └── urfd.yaml
+│
+├── data/
+│   └── labels.example.csv
+│
+├── scripts/
+│   ├── audit_dataset.py
+│   ├── audit_no_frame_writes.py
+│   ├── cache_skeletons.py
+│   ├── download_urfd.py
+│   ├── evaluate.py
+│   ├── make_synthetic_cache.py
+│   ├── run_realtime.py
+│   ├── train.py
+│   └── tune_alerts.py
+│
+├── src/
+│   ├── data/
+│   ├── features/
+│   ├── model/
+│   ├── pose/
+│   └── realtime/
+│
+├── tests/
+│
+├── requirements.txt
+├── .gitignore
+└── README.md
 ```
-video frame  -->  YOLOv8n-pose  -->  tracker  -->  (17,3) keypoints
-                                                      |
-                                                      v
-                                         normalize + dynamics  -->  (T,55)
-                                                      |
-                                                      v
-                                         window (30 @ stride 5)
-                                                      |
-                                                      v
-                                         GRU / 1D-CNN  -->  p(fall)
-                                                      |
-                                                      v
-                                         AlertManager (K positives + cooldown)
-                                                      |
-                                                      v
-                                         alerts.jsonl
+
+Generated files such as datasets, skeleton caches, model checkpoints, and local environments are intentionally excluded from version control.
+
+## 4. Dataset
+
+The experiments use the UR Fall Detection (URFD) dataset.
+
+The current dataset setup contains:
+
+- 70 video clips.
+- 70 corresponding labels.
+- 40 group identifiers.
+- Group-disjoint train, validation, and test splits.
+
+| Split | Groups | Clips |
+|---|---:|---:|
+| Train | 28 | 49 |
+| Validation | 6 | 11 |
+| Test | 6 | 10 |
+| **Total** | **40** | **70** |
+
+The `group` field is used as a sequence/scene grouping proxy to reduce leakage between related clips.
+
+**Important limitation:** These group identifiers are not confirmed subject identities. Therefore, this evaluation must not be described as person-independent validation.
+
+### Dataset preparation
+
+Dataset videos and labels are not included in this repository.
+
+Place the dataset files in the expected local data directories and prepare the label CSV using the supplied example:
+
+```text
+data/labels.example.csv
 ```
 
-## What's in the repo
+The active configuration expects:
 
-| path | what it is |
-|------|------------|
-| `configs/default.yaml` | main knobs (window, model, alerts, split) |
-| `configs/urfd.yaml` | same as default, but `k_consecutive: 4` — better on URFD ADL false alarms |
-| `configs/smoke.yaml` | short CPU-friendly run for sanity checks |
-| `src/pose/` | YOLO wrapper + IoU/centroid tracker |
-| `src/features/` | torso normalize, trunk angle, hip vel/acc (numpy) |
-| `src/model/` | GRU, 1D-CNN, focal loss |
-| `src/data/` | window dataset + group-disjoint split |
-| `src/realtime/` | debounced alerts + JSON log |
-| `scripts/download_urfd.py` | pulls cam0 MP4s + builds `data/labels.csv` |
-| `scripts/cache_skeletons.py` | videos → `cache/skeletons/*.npz` |
-| `scripts/train.py` / `evaluate.py` / `run_realtime.py` | train, eval, demo |
-| `scripts/make_synthetic_cache.py` | fake skeletons if you don't want to download URFD yet |
-| `scripts/audit_no_frame_writes.py` | fails if anyone adds `imwrite` / `VideoWriter` etc. |
-| `tests/` | 25 unit tests (features, tracker, alert schema) |
+```yaml
+data:
+  cache_dir: cache/skeletons_dense_candidate
+  labels_csv: data/labels.csv
+```
 
-## Setup
+Check the dataset preparation script options before downloading or processing:
 
-```bash
+```powershell
+.venv\Scripts\python.exe scripts\download_urfd.py --help
+```
+
+Audit the dataset after preparation:
+
+```powershell
+.venv\Scripts\python.exe scripts\audit_dataset.py --help
+```
+
+## 5. Environment Setup
+
+The project was developed and tested on Windows with Python 3.13 and an NVIDIA GPU.
+
+Create and activate a virtual environment:
+
+```powershell
 python -m venv .venv
-# Windows: .venv\Scripts\activate
+.venv\Scripts\Activate.ps1
+```
+
+Install dependencies:
+
+```powershell
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Torch is CPU-fine for training here; for the live demo a CUDA build helps
-FPS. Pose weights (`yolov8n-pose.pt`) download on first use.
+For GPU acceleration, install a PyTorch build compatible with your NVIDIA driver and CUDA environment. Verify GPU availability:
 
-## Run on real URFD data
-
-```bash
-# 1) download 70 cam0 clips + labels (from the official URFD mirror)
-python scripts/download_urfd.py
-
-# 2) pose extraction (this is the privacy cut: after this, no pixels needed)
-python scripts/cache_skeletons.py --videos data/videos --overwrite
-
-# 3) train
-python scripts/train.py --model gru
-python scripts/train.py --model cnn
-
-# 4) evaluate (use urfd.yaml — K=4)
-python scripts/evaluate.py --config configs/urfd.yaml --ckpt checkpoints/best_gru.pt --split test
-python scripts/evaluate.py --config configs/urfd.yaml --ckpt checkpoints/best_cnn.pt --split test
-
-# 5) demo — privacy mode draws skeletons on a blank canvas (q to quit)
-python scripts/run_realtime.py --config configs/urfd.yaml --ckpt checkpoints/best_gru.pt --source 0
-python scripts/run_realtime.py --config configs/urfd.yaml --ckpt checkpoints/best_gru.pt --source data/videos/fall-01-cam0.mp4
-# debug overlay on the actual frames (still not recorded):
-python scripts/run_realtime.py --ckpt checkpoints/best_gru.pt --source data/videos/fall-01-cam0.mp4 --no-privacy
+```powershell
+.venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 ```
 
-`download_urfd.py` names clips `fall-XX-cam0.mp4` / `adl-XX-cam0.mp4` and
-writes `data/labels.csv`. Fall spans come from the official posture CSV
-(label `0` = falling, `1` = lying). Groups are `group01`…`group40` so
-`fall-N` and `adl-N` stay together — URFD doesn't ship subject IDs, so this
-is a stand-in to keep train/val/test from leaking the same scene.
+The training and evaluation experiments reported below were run on an NVIDIA GeForce RTX 3050 Laptop GPU.
 
-If you already have videos, skip the downloader and follow
-`data/labels.example.csv`.
+## 6. Configuration
 
-### No dataset handy?
+The main URFD configuration is:
 
-```bash
-python scripts/make_synthetic_cache.py
-python scripts/train.py --config configs/smoke.yaml --model gru
+```text
+configs/urfd.yaml
 ```
 
-Useful for checking imports and the train loop. Don't treat those numbers
-as real performance.
+Important settings include:
 
-## Results on URFD (group-disjoint test)
+| Parameter | Value |
+|---|---:|
+| Window size | 30 frames |
+| Window stride | 5 frames |
+| Model | GRU |
+| Input dimension | 55 |
+| Hidden dimension | 64 |
+| GRU layers | 2 |
+| Dropout | 0.3 |
+| Alert threshold | 0.60 |
+| Consecutive positive windows | 4 |
+| Alert cooldown | 10 seconds |
 
-Trained locally on the full cam0 set (70 clips). Window threshold `0.60`.
-Event score: alert within ±2 s of the annotated fall.
+The active skeleton cache directory is:
 
-**Window-level**
-
-| model    | P     | R     | F1    | params |
-|----------|-------|-------|-------|--------|
-| GRU 2×64 | 0.683 | 0.700 | 0.691 | ~48 k  |
-| 1D-CNN   | 0.659 | 0.675 | 0.667 | ~142 k |
-
-**Event-level** (`configs/urfd.yaml`, K=4, cooldown 10 s)
-
-| model    | P     | R     | F1    |
-|----------|-------|-------|-------|
-| GRU 2×64 | 1.000 | 1.000 | 1.000 |
-| 1D-CNN   | 0.667 | 1.000 | 0.800 |
-
-With the default K=3 the GRU event F1 was ~0.89 — one extra ADL false
-alarm. Bumping K to 4 cleared it (same advice as below for fast sit-downs).
-Test set is small (a handful of held-out fall events), so take the perfect
-score with a grain of salt; re-check if you change the split seed.
-
-`evaluate.py` also dumps the hardest false-positive windows. On this run
-they clustered on a few ADL clips (`adl-02`, `adl-34`, `adl-39`) — looks
-like sit / lie transitions more than random noise.
-
-What I'd tweak next if FPs come back:
-- fast sit → raise `alerts.k_consecutive` first (don't jump straight to the threshold)
-- intentional lie → the model is leaning on posture; add more of those ADLs to train
-
-Target I care about in practice: event F1 ≥ 0.90 and live demo ≥ ~15 FPS
-at 640 px when a GPU is available.
-
-## Privacy (what actually gets saved)
-
-Kept on disk:
-- `cache/skeletons/*.npz` — keypoints, frame index, fps
-- `checkpoints/*.pt` — weights + the config used to train them
-- `alerts.jsonl` — `{event, timestamp, track_id, confidence}` only
-
-Not kept:
-- frames, crops, thumbnails, recordings — there is no save path for them
-
-Two checks for that: the alert schema unit test, and
-`scripts/audit_no_frame_writes.py` which greps `src/` + `scripts/` for
-image/video writers.
-
-Honest caveat: skeletons are still personal motion data, and the JSON log
-has timestamps. How long you keep those is a deployment choice, not
-something the code decides.
-
-## Tests
-
-```bash
-python -m pytest tests/ -v
-python scripts/audit_no_frame_writes.py
+```text
+cache/skeletons_dense_candidate
 ```
 
-## Notes
+The `default.yaml` and `smoke.yaml` configurations are retained for general and lightweight development workflows.
 
-- Seed is `42` in the yaml; splits are deterministic given the group list.
-- `.gitignore` excludes videos, cache, checkpoints, and `labels.csv` — regenerate with the scripts above.
-- Cite URFD if you publish with it: Kwolek & Kepski, CMPB 2014.
+## 7. Training
+
+Train the GRU model using the URFD configuration:
+
+```powershell
+.venv\Scripts\python.exe scripts\train.py `
+  --config configs\urfd.yaml `
+  --model gru `
+  --seed 42 `
+  --split-seed 42 `
+  --ckpt-dir checkpoints\urfd_dense_gru_gpu
+```
+
+The training script uses the training and validation splits. The test split is reserved for final evaluation.
+
+The best checkpoint from the reported GPU training run is:
+
+```text
+checkpoints/urfd_dense_gru_gpu/best_gru.pt
+```
+
+The best validation window F1 during training was approximately 0.747.
+
+## 8. Alert Parameter Tuning
+
+Alert threshold and consecutive-positive settings can be tuned using the validation split only:
+
+```powershell
+.venv\Scripts\python.exe scripts\tune_alerts.py `
+  --config configs\urfd.yaml `
+  --ckpt checkpoints\urfd_dense_gru_gpu\best_gru.pt
+```
+
+The tuning experiment found several configurations with the same event-level F1.
+
+The selected operating point retained in the final configuration is:
+
+```yaml
+alerts:
+  threshold: 0.6
+  k_consecutive: 4
+  cooldown_s: 10.0
+```
+
+At threshold 0.60, values of 3, 4, and 5 consecutive positive windows achieved the same validation event-level metrics in the reported experiment.
+
+The value of 4 was retained for consistency with the final test evaluation.
+
+**Important:** Alert parameters must not be selected by repeatedly optimizing against test results.
+
+## 9. Evaluation
+
+Evaluate on the validation split:
+
+```powershell
+.venv\Scripts\python.exe scripts\evaluate.py `
+  --config configs\urfd.yaml `
+  --ckpt checkpoints\urfd_dense_gru_gpu\best_gru.pt `
+  --split val `
+  --top-fp 10
+```
+
+Evaluate on the test split:
+
+```powershell
+.venv\Scripts\python.exe scripts\evaluate.py `
+  --config configs\urfd.yaml `
+  --ckpt checkpoints\urfd_dense_gru_gpu\best_gru.pt `
+  --split test `
+  --top-fp 10
+```
+
+### Reported results
+
+The following results were obtained with the GRU checkpoint and alert threshold 0.60.
+
+**Window-level metrics**
+
+| Metric | Validation | Test |
+|---|---:|---:|
+| Precision | 0.848 | 0.642 |
+| Recall | 0.667 | 0.773 |
+| F1-score | 0.747 | 0.701 |
+| True Positives | 28 | 34 |
+| False Positives | 5 | 19 |
+| False Negatives | 14 | 10 |
+
+**Event-level metrics**
+
+| Metric | Validation | Test |
+|---|---:|---:|
+| Precision | 1.000 | 0.800 |
+| Recall | 0.800 | 1.000 |
+| F1-score | 0.889 | 0.889 |
+| True Positives | 4 | 4 |
+| False Positives | 0 | 1 |
+| False Negatives | 1 | 0 |
+
+### Interpretation
+
+The test evaluation detected all four fall events in the test split, with one additional false-positive event.
+
+Although the event-level F1-score was 0.889, the window-level test F1-score was 0.701, indicating that false-positive windows remain an important challenge.
+
+**Small-sample limitation:** The test split contains only four positive fall events. Consequently, event-level metrics are sensitive to individual predictions and should not be interpreted as strong evidence of generalization.
+
+The current experiment does not establish robustness across unseen people, environments, camera viewpoints, or real-world deployment conditions.
+
+## 10. Testing
+
+Run the project test suite:
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q tests
+```
+
+The latest verified test result:
+
+```text
+39 passed
+```
+
+Check Python syntax:
+
+```powershell
+.venv\Scripts\python.exe -m compileall -q src tests scripts
+```
+
+Check Git whitespace errors:
+
+```powershell
+git diff --check
+```
+
+## 11. Privacy Considerations
+
+The project is designed around skeletal keypoints and motion features rather than storing raw RGB frames as model inputs.
+
+Privacy-related considerations include:
+
+- Avoiding unnecessary storage of raw video frames.
+- Using skeletal representations for temporal classification.
+- Keeping local datasets and generated artifacts out of public version control.
+- Providing an audit script for checking frame-write behavior.
+
+The privacy audit can be inspected and run using:
+
+```powershell
+.venv\Scripts\python.exe scripts\audit_no_frame_writes.py --help
+```
+
+Skeleton data can still contain sensitive behavioral information. Therefore, access control, retention policies, and secure handling remain necessary.
+
+## 12. Limitations and Future Work
+
+Current limitations:
+
+- Small number of fall events in the test split.
+- Window-level false positives remain relatively high.
+- Group identifiers are not verified subject identities.
+- No demonstrated person-independent generalization.
+- No comprehensive real-world deployment validation.
+- No established clinical or safety certification.
+
+Potential future improvements:
+
+- Evaluation on larger and more diverse datasets.
+- Subject-independent validation using verified subject identities.
+- Improved false-positive suppression.
+- Robustness testing across camera viewpoints and environments.
+- Real-time performance benchmarking on different hardware.
+- Additional privacy and data-retention audits.
+
+## 13. Reproducibility and Artifact Policy
+
+The following local artifacts are not distributed through Git:
+
+```text
+.venv/
+cache/
+checkpoints/
+data/labels.csv
+data/raw/
+data/videos/
+*.pt
+*.pth
+__pycache__/
+.pytest_cache/
+```
+
+To reproduce the experiments, prepare the dataset, install dependencies, generate the skeleton cache, train the model, and evaluate using the commands above.
+
+Model checkpoints and dataset artifacts must be generated or obtained separately.
+
+## 14. Disclaimer
+
+This repository is a research and development prototype.
+
+It is not a certified medical device or a replacement for professional monitoring systems. It must not be relied upon as the sole mechanism for detecting falls or ensuring personal safety.
+
+---
+
+**Project:** Privacy-Preserving Fall Detection from Skeleton Dynamics  
+**Primary model:** GRU  
+**Dataset:** URFD  
+**Framework:** PyTorch  
+**Evaluation:** Group-disjoint train/validation/test split

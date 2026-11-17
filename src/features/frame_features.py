@@ -149,50 +149,114 @@ def hip_center_y(kpts: np.ndarray, min_conf: float = 0.30) -> float:
 # ----------------------------------------------------------------------
 # Sequence-level dynamics
 # ----------------------------------------------------------------------
-def finite_diff(series: np.ndarray, fps: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Velocity and acceleration of a 1-D series via central differences.
 
-    Why central differences: O(h^2) accurate and phase-aligned (forward
-    differences shift the velocity peak half a frame early, which
-    matters when the fall impact spans only ~5 frames). Endpoints use
-    one-sided differences. NaNs (occluded frames) are linearly
-    interpolated first so a single dropped detection doesn't inject an
-    infinite-velocity spike.
+def finite_diff(
+    series: np.ndarray,
+    fps: float,
+    max_gap: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute derivatives without bridging long or edge missing-data gaps.
 
-    Args:
-        series: (T,) values in pixels (or any unit).
-        fps: frames per second — converts /frame to /second so the
-             learned thresholds transfer between videos of different
-             frame rates.
-    Returns:
-        vel, acc: (T,) arrays, units/s and units/s^2.
+    Only bounded internal gaps of at most max_gap samples are interpolated.
+    Derivatives are computed independently on contiguous valid runs.
+    Invalid samples receive zero derivatives; validity remains represented
+    by the keypoint confidence-mask features.
     """
     s = np.asarray(series, dtype=np.float64).copy()
     T = len(s)
-    if T == 0:
-        return np.zeros(0), np.zeros(0)
-    nans = np.isnan(s)
-    if nans.all():
-        s[:] = 0.0
-    elif nans.any():
-        idx = np.arange(T)
-        s[nans] = np.interp(idx[nans], idx[~nans], s[~nans])
 
-    vel = np.gradient(s) * fps          # central diffs, one-sided at ends
-    acc = np.gradient(vel) * fps
+    if T == 0:
+        return np.zeros(0, np.float32), np.zeros(0, np.float32)
+
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError(f"fps must be finite and positive, got {fps}")
+    if max_gap < 0:
+        raise ValueError("max_gap must be non-negative")
+
+    valid = np.isfinite(s)
+
+    # Fill only short gaps bounded by valid observations on both sides.
+    i = 0
+    while i < T:
+        if valid[i]:
+            i += 1
+            continue
+
+        start = i
+        while i < T and not valid[i]:
+            i += 1
+        end = i  # exclusive
+
+        gap_len = end - start
+        bounded = start > 0 and end < T
+
+        if bounded and gap_len <= max_gap:
+            left = s[start - 1]
+            right = s[end]
+            s[start:end] = np.linspace(
+                left, right, gap_len + 2, dtype=np.float64
+            )[1:-1]
+            valid[start:end] = True
+
+    vel = np.zeros(T, dtype=np.float64)
+    acc = np.zeros(T, dtype=np.float64)
+
+    # Find contiguous valid runs and differentiate each run independently.
+    i = 0
+    while i < T:
+        if not valid[i]:
+            i += 1
+            continue
+
+        start = i
+        while i < T and valid[i]:
+            i += 1
+        end = i
+
+        run = s[start:end]
+        if len(run) < 2:
+            continue
+
+        run_vel = np.gradient(run) * fps
+        run_acc = np.gradient(run_vel) * fps
+
+        vel[start:end] = run_vel
+        acc[start:end] = run_acc
+
     return vel.astype(np.float32), acc.astype(np.float32)
 
 
-def normalized_hip_dynamics(hip_y: np.ndarray, scales: np.ndarray, fps: float
-                            ) -> Tuple[np.ndarray, np.ndarray]:
-    """Hip vertical velocity/acceleration in *torso lengths per second*.
 
-    Why: raw px/s velocity depends on camera distance; dividing by the
-    per-frame torso scale makes "the pelvis dropped 2 torso-lengths in
-    0.5 s" mean the same thing at any distance. Falls show a large
-    positive (downward, image coords) velocity spike followed by a
-    deceleration spike at impact — the classifier's key dynamic cue.
+def normalized_hip_dynamics(
+    hip_y: np.ndarray,
+    scales: np.ndarray,
+    fps: float,
+    max_gap: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute hip dynamics using a robust clip-level torso scale.
+
+    If no valid torso scale exists, return zero dynamics rather
+    than incorrectly treating pixel coordinates as normalized units.
     """
-    scales = np.maximum(np.asarray(scales, dtype=np.float64), EPS)
-    vel, acc = finite_diff(np.asarray(hip_y, dtype=np.float64), fps)
-    return (vel / scales).astype(np.float32), (acc / scales).astype(np.float32)
+    hip_y = np.asarray(hip_y, dtype=np.float64)
+    scales = np.asarray(scales, dtype=np.float64)
+
+    if hip_y.ndim != 1 or scales.ndim != 1:
+        raise ValueError("hip_y and scales must be one-dimensional")
+
+    if hip_y.shape != scales.shape:
+        raise ValueError(
+            f"hip_y and scales must have the same shape, "
+            f"got {hip_y.shape} and {scales.shape}"
+        )
+
+    valid_scales = scales[np.isfinite(scales) & (scales > EPS)]
+
+    if len(valid_scales) == 0:
+        zeros = np.zeros(len(hip_y), dtype=np.float32)
+        return zeros.copy(), zeros.copy()
+
+    stable_scale = float(np.median(valid_scales))
+    normalized_hip_y = hip_y / stable_scale
+
+    return finite_diff(normalized_hip_y, fps, max_gap=max_gap)
